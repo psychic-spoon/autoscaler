@@ -21,9 +21,10 @@ import (
 
 	apiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/klog/v2"
+
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/limitrange"
-	"k8s.io/klog/v2"
 )
 
 // NewCappingRecommendationProcessor constructs new RecommendationsProcessor that adjusts recommendation
@@ -52,11 +53,19 @@ type cappingRecommendationProcessor struct {
 
 // Apply returns a recommendation for the given pod, adjusted to obey policy and limits.
 func (c *cappingRecommendationProcessor) Apply(
-	podRecommendation *vpa_types.RecommendedPodResources,
-	policy *vpa_types.PodResourcePolicy,
-	conditions []vpa_types.VerticalPodAutoscalerCondition,
+	vpa *vpa_types.VerticalPodAutoscaler,
 	pod *apiv1.Pod) (*vpa_types.RecommendedPodResources, ContainerToAnnotationsMap, error) {
 	// TODO: Annotate if request enforced by maintaining proportion with limit and allowed limit range is in conflict with policy.
+
+	if vpa == nil {
+		return nil, nil, fmt.Errorf("cannot process nil vpa")
+	}
+	if pod == nil {
+		return nil, nil, fmt.Errorf("cannot process nil pod")
+	}
+
+	policy := vpa.Spec.ResourcePolicy
+	podRecommendation := vpa.Status.Recommendation
 
 	if podRecommendation == nil && policy == nil {
 		// If there is no recommendation and no policies have been defined then no recommendation can be computed.
@@ -76,13 +85,13 @@ func (c *cappingRecommendationProcessor) Apply(
 		container := getContainer(containerRecommendation.ContainerName, pod)
 
 		if container == nil {
-			klog.V(2).Infof("no matching Container found for recommendation %s", containerRecommendation.ContainerName)
+			klog.V(2).InfoS("No matching Container found for recommendation", "containerName", containerRecommendation.ContainerName, "vpa", klog.KObj(vpa))
 			continue
 		}
 
 		containerLimitRange, err := c.limitsRangeCalculator.GetContainerLimitRangeItem(pod.Namespace)
 		if err != nil {
-			klog.Warningf("failed to fetch LimitRange for %v namespace", pod.Namespace)
+			klog.V(0).InfoS("Failed to fetch LimitRange for namespace", "namespace", pod.Namespace)
 		}
 		updatedContainerResources, containerAnnotations, err := getCappedRecommendationForContainer(
 			*container, &containerRecommendation, policy, containerLimitRange)
@@ -116,7 +125,6 @@ func getCappedRecommendationForContainer(
 	cappingAnnotations := make([]string, 0)
 
 	process := func(recommendation apiv1.ResourceList, genAnnotations bool) {
-		// TODO: Add annotation if limitRange is conflicting with VPA policy.
 		limitAnnotations := applyContainerLimitRange(recommendation, container, limitRange)
 		annotations := applyVPAPolicy(recommendation, containerPolicy)
 		if genAnnotations {
@@ -177,23 +185,46 @@ func applyVPAPolicy(recommendation apiv1.ResourceList, policy *vpa_types.Contain
 
 func applyVPAPolicyForContainer(containerName string,
 	containerRecommendation *vpa_types.RecommendedContainerResources,
-	policy *vpa_types.PodResourcePolicy) (*vpa_types.RecommendedContainerResources, error) {
+	policy *vpa_types.PodResourcePolicy,
+	globalMaxAllowed apiv1.ResourceList) (*vpa_types.RecommendedContainerResources, error) {
 	if containerRecommendation == nil {
 		return nil, fmt.Errorf("no recommendation available for container name %v", containerName)
 	}
 	cappedRecommendations := containerRecommendation.DeepCopy()
-	// containerPolicy can be nil (user does not have to configure it).
 	containerPolicy := GetContainerResourcePolicy(containerName, policy)
-	if containerPolicy == nil {
-		return cappedRecommendations, nil
+
+	var minAllowed apiv1.ResourceList
+	if containerPolicy != nil {
+		minAllowed = containerPolicy.MinAllowed
+	}
+
+	var maxAllowed apiv1.ResourceList
+	if containerPolicy != nil {
+		// Deep copy containerPolicy.MaxAllowed as maxAllowed can later on be merged with globalMaxAllowed.
+		// Deep copy is needed to prevent unwanted modifications to containerPolicy.MaxAllowed.
+		maxAllowed = containerPolicy.MaxAllowed.DeepCopy()
+	}
+	if maxAllowed == nil {
+		maxAllowed = globalMaxAllowed
+	} else {
+		// Set resources from the global max allowed if the VPA max allowed is missing them.
+		for resourceName, quantity := range globalMaxAllowed {
+			if _, ok := maxAllowed[resourceName]; !ok {
+				maxAllowed[resourceName] = quantity
+			}
+		}
 	}
 
 	process := func(recommendation apiv1.ResourceList) {
-		for resourceName, recommended := range recommendation {
-			cappedToMin, _ := maybeCapToPolicyMin(recommended, resourceName, containerPolicy)
-			recommendation[resourceName] = cappedToMin
-			cappedToMax, _ := maybeCapToPolicyMax(cappedToMin, resourceName, containerPolicy)
-			recommendation[resourceName] = cappedToMax
+		for resourceName := range recommendation {
+			if minAllowed != nil {
+				cappedToMin, _ := maybeCapToMin(recommendation[resourceName], resourceName, minAllowed)
+				recommendation[resourceName] = cappedToMin
+			}
+			if maxAllowed != nil {
+				cappedToMax, _ := maybeCapToMax(recommendation[resourceName], resourceName, maxAllowed)
+				recommendation[resourceName] = cappedToMax
+			}
 		}
 	}
 
@@ -234,19 +265,16 @@ func maybeCapToMin(recommended resource.Quantity, resourceName apiv1.ResourceNam
 
 // ApplyVPAPolicy returns a recommendation, adjusted to obey policy.
 func ApplyVPAPolicy(podRecommendation *vpa_types.RecommendedPodResources,
-	policy *vpa_types.PodResourcePolicy) (*vpa_types.RecommendedPodResources, error) {
+	policy *vpa_types.PodResourcePolicy, globalMaxAllowed apiv1.ResourceList) (*vpa_types.RecommendedPodResources, error) {
 	if podRecommendation == nil {
 		return nil, nil
-	}
-	if policy == nil {
-		return podRecommendation, nil
 	}
 
 	updatedRecommendations := []vpa_types.RecommendedContainerResources{}
 	for _, containerRecommendation := range podRecommendation.ContainerRecommendations {
 		containerName := containerRecommendation.ContainerName
 		updatedContainerResources, err := applyVPAPolicyForContainer(containerName,
-			&containerRecommendation, policy)
+			&containerRecommendation, policy, globalMaxAllowed)
 		if err != nil {
 			return nil, fmt.Errorf("cannot apply policy on recommendation for container name %v", containerName)
 		}

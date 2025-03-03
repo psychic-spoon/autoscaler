@@ -114,6 +114,9 @@ const (
 	Poll                       FunctionLabel = "poll"
 	Reconfigure                FunctionLabel = "reconfigure"
 	Autoscaling                FunctionLabel = "autoscaling"
+	LoopWait                   FunctionLabel = "loopWait"
+	BulkListAllGceInstances    FunctionLabel = "bulkListInstances:listAllInstances"
+	BulkListMigInstances       FunctionLabel = "bulkListInstances:listMigInstances"
 )
 
 var (
@@ -390,20 +393,22 @@ var (
 		},
 	)
 
-	nodeGroupCreationCount = k8smetrics.NewCounter(
+	nodeGroupCreationCount = k8smetrics.NewCounterVec(
 		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "created_node_groups_total",
 			Help:      "Number of node groups created by Node Autoprovisioning.",
 		},
+		[]string{"group_type"},
 	)
 
-	nodeGroupDeletionCount = k8smetrics.NewCounter(
+	nodeGroupDeletionCount = k8smetrics.NewCounterVec(
 		&k8smetrics.CounterOpts{
 			Namespace: caNamespace,
 			Name:      "deleted_node_groups_total",
 			Help:      "Number of node groups deleted by Node Autoprovisioning.",
 		},
+		[]string{"group_type"},
 	)
 
 	nodeTaintsCount = k8smetrics.NewGaugeVec(
@@ -413,6 +418,14 @@ var (
 			Help:      "Number of taints per type used in the cluster.",
 		},
 		[]string{"type"},
+	)
+
+	inconsistentInstancesMigsCount = k8smetrics.NewGauge(
+		&k8smetrics.GaugeOpts{
+			Namespace: caNamespace,
+			Name:      "inconsistent_instances_migs_count",
+			Help:      "Number of migs where instance count according to InstanceGroupManagers.List() differs from the results of Instances.List(). This can happen when some instances are abandoned or a user edits instance 'created-by' metadata.",
+		},
 	)
 )
 
@@ -449,6 +462,7 @@ func RegisterAll(emitPerNodeGroupMetrics bool) {
 	legacyregistry.MustRegister(nodeGroupDeletionCount)
 	legacyregistry.MustRegister(pendingNodeDeletions)
 	legacyregistry.MustRegister(nodeTaintsCount)
+	legacyregistry.MustRegister(inconsistentInstancesMigsCount)
 
 	if emitPerNodeGroupMetrics {
 		legacyregistry.MustRegister(nodesGroupMinNodes)
@@ -457,6 +471,28 @@ func RegisterAll(emitPerNodeGroupMetrics bool) {
 		legacyregistry.MustRegister(nodesGroupHealthiness)
 		legacyregistry.MustRegister(nodeGroupBackOffStatus)
 	}
+}
+
+// InitMetrics initializes all metrics
+func InitMetrics() {
+	for _, errorType := range []errors.AutoscalerErrorType{errors.CloudProviderError, errors.ApiCallError, errors.InternalError, errors.TransientError, errors.ConfigurationError, errors.NodeGroupDoesNotExistError, errors.UnexpectedScaleDownStateError} {
+		errorsCount.WithLabelValues(string(errorType)).Add(0)
+	}
+
+	for _, reason := range []FailedScaleUpReason{CloudProviderError, APIError, Timeout} {
+		scaleDownCount.WithLabelValues(string(reason)).Add(0)
+		failedScaleUpCount.WithLabelValues(string(reason)).Add(0)
+	}
+
+	for _, result := range []PodEvictionResult{PodEvictionSucceed, PodEvictionFailed} {
+		evictionsCount.WithLabelValues(string(result)).Add(0)
+	}
+
+	skippedScaleEventsCount.WithLabelValues(DirectionScaleDown, CpuResourceLimit).Add(0)
+	skippedScaleEventsCount.WithLabelValues(DirectionScaleDown, MemoryResourceLimit).Add(0)
+	skippedScaleEventsCount.WithLabelValues(DirectionScaleUp, CpuResourceLimit).Add(0)
+	skippedScaleEventsCount.WithLabelValues(DirectionScaleUp, MemoryResourceLimit).Add(0)
+
 }
 
 // UpdateDurationFromStart records the duration of the step identified by the
@@ -643,12 +679,22 @@ func UpdateNapEnabled(enabled bool) {
 
 // RegisterNodeGroupCreation registers node group creation
 func RegisterNodeGroupCreation() {
-	nodeGroupCreationCount.Add(1.0)
+	RegisterNodeGroupCreationWithLabelValues("")
+}
+
+// RegisterNodeGroupCreationWithLabelValues registers node group creation with the provided labels
+func RegisterNodeGroupCreationWithLabelValues(groupType string) {
+	nodeGroupCreationCount.WithLabelValues(groupType).Add(1.0)
 }
 
 // RegisterNodeGroupDeletion registers node group deletion
 func RegisterNodeGroupDeletion() {
-	nodeGroupDeletionCount.Add(1.0)
+	RegisterNodeGroupDeletionWithLabelValues("")
+}
+
+// RegisterNodeGroupDeletionWithLabelValues registers node group deletion with the provided labels
+func RegisterNodeGroupDeletionWithLabelValues(groupType string) {
+	nodeGroupDeletionCount.WithLabelValues(groupType).Add(1.0)
 }
 
 // UpdateScaleDownInCooldown registers if the cluster autoscaler
@@ -701,4 +747,11 @@ func ObservePendingNodeDeletions(value int) {
 // ObserveNodeTaintsCount records the node taints count of given type.
 func ObserveNodeTaintsCount(taintType string, count float64) {
 	nodeTaintsCount.WithLabelValues(taintType).Set(count)
+}
+
+// UpdateInconsistentInstancesMigsCount records the observed number of migs where instance count
+// according to InstanceGroupManagers.List() differs from the results of Instances.List().
+// This can happen when some instances are abandoned or a user edits instance 'created-by' metadata.
+func UpdateInconsistentInstancesMigsCount(migCount int) {
+	inconsistentInstancesMigsCount.Set(float64(migCount))
 }

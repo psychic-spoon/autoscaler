@@ -22,6 +22,7 @@ import (
 
 	core "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+
 	resource_admission "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/admission-controller/resource/pod/recommendation"
 	vpa_types "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
@@ -51,7 +52,7 @@ func (c *resourcesUpdatesPatchCalculator) CalculatePatches(pod *core.Pod, vpa *v
 
 	containersResources, annotationsPerContainer, err := c.recommendationProvider.GetContainersResourcesForPod(pod, vpa)
 	if err != nil {
-		return []resource_admission.PatchRecord{}, fmt.Errorf("Failed to calculate resource patch for pod %v/%v: %v", pod.Namespace, pod.Name, err)
+		return []resource_admission.PatchRecord{}, fmt.Errorf("Failed to calculate resource patch for pod %s/%s: %v", pod.Namespace, pod.Name, err)
 	}
 
 	if annotationsPerContainer == nil {

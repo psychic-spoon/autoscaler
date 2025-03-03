@@ -9,6 +9,7 @@ GOOS?=linux
 GOARCH?=$(shell go env GOARCH)
 REGISTRY?=staging-k8s.gcr.io
 DOCKER_NETWORK?=default
+SUPPORTED_BUILD_TAGS=$(shell ls cloudprovider/builder/ | grep -e '^builder_.*\.go' | sed 's/builder_\(.*\)\.go/\1/')
 ifdef BUILD_TAGS
   TAGS_FLAG=--tags ${BUILD_TAGS}
   PROVIDER=-${BUILD_TAGS}
@@ -37,12 +38,20 @@ IMAGE=$(REGISTRY)/cluster-autoscaler$(PROVIDER)
 export DOCKER_CLI_EXPERIMENTAL := enabled
 
 build:
-	@echo "⚠️  WARNING: The vendor directory will be removed soon. \
-	Please make sure your dependencies are managed via Go modules."
 	@$(MAKE) build-arch-$(GOARCH)
 
 build-arch-%: clean-arch-%
 	$(ENVVAR) GOOS=$(GOOS) GOARCH=$* go build -o cluster-autoscaler-$* ${LDFLAGS_FLAG} ${TAGS_FLAG}
+
+test-build-tags:
+	@if [ -z "$(SUPPORTED_BUILD_TAGS)" ]; then \
+		echo "No supported build tags found"; \
+		exit 1; \
+	fi
+	@for tag in $(SUPPORTED_BUILD_TAGS); do \
+		echo "Testing build with tag $$tag"; \
+		BUILD_TAGS=$$tag $(MAKE) build || exit 1; \
+	done
 
 test-unit: clean build
 	go test --test.short -race ./... ${TAGS_FLAG}
@@ -122,7 +131,7 @@ $(LOCALBIN):
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 
 ## Tool Versions
-CONTROLLER_TOOLS_VERSION ?= v0.13.0
+CONTROLLER_TOOLS_VERSION ?= v0.14.0
 
 .PHONY: controller-gen
 controller-gen: $(CONTROLLER_GEN) ## Download controller-gen locally if necessary.
@@ -131,4 +140,4 @@ $(CONTROLLER_GEN): $(LOCALBIN)
 
 .PHONY: manifest
 manifest: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./apis/..." output:crd:artifacts:config=apis/config/crd

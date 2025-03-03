@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+
 	v1 "k8s.io/autoscaler/vertical-pod-autoscaler/pkg/apis/autoscaling.k8s.io/v1"
 	"k8s.io/autoscaler/vertical-pod-autoscaler/pkg/utils/test"
 
@@ -54,6 +55,21 @@ func TestLoopInit(t *testing.T) {
 		WithEvictionRequirements(podEvictionRequirements).
 		Get()
 	vpaToPodMap := map[*v1.VerticalPodAutoscaler][]*corev1.Pod{testVPA: {pod, pod2}}
+
+	t.Run("it should not require UpdateMode and EvictionRequirements.", func(t *testing.T) {
+		sdpea := NewScalingDirectionPodEvictionAdmission()
+		sdpea.LoopInit(nil, vpaToPodMap)
+
+		newTestVPA := test.VerticalPodAutoscaler().
+			WithName("test-vpa").
+			WithContainer(container1Name).
+			Get()
+
+		newVpaToPodMap := map[*v1.VerticalPodAutoscaler][]*corev1.Pod{newTestVPA: {pod, pod2}}
+
+		sdpea.LoopInit(nil, newVpaToPodMap)
+		assert.Len(t, sdpea.(*scalingDirectionPodEvictionAdmission).EvictionRequirements, 0)
+	})
 
 	t.Run("it should store EvictionRequirements from VPA in a map per Pod", func(t *testing.T) {
 		sdpea := NewScalingDirectionPodEvictionAdmission()
@@ -381,6 +397,26 @@ func TestAdmitForMultipleContainer(t *testing.T) {
 		recommendation := &v1.RecommendedPodResources{
 			ContainerRecommendations: []v1.RecommendedContainerResources{
 				test.Recommendation().WithContainer(container1Name).WithTarget("200m", "10Gi").GetContainerResources(),
+				test.Recommendation().WithContainer(container2Name).WithTarget("300m", "10Gi").GetContainerResources(),
+			},
+		}
+
+		assert.Equal(tt, false, sdpea.Admit(pod, recommendation))
+	})
+
+	t.Run("it should not admit the Pod even if there is a container that doesn't have a Recommendation and the other one doesn't fulfill the EvictionRequirements", func(tt *testing.T) {
+		evictionRequirements := map[*corev1.Pod][]*v1.EvictionRequirement{
+			pod: {
+				{
+					Resources:         []corev1.ResourceName{corev1.ResourceCPU},
+					ChangeRequirement: v1.TargetHigherThanRequests,
+				},
+			},
+		}
+		sdpea := NewScalingDirectionPodEvictionAdmission()
+		sdpea.(*scalingDirectionPodEvictionAdmission).EvictionRequirements = evictionRequirements
+		recommendation := &v1.RecommendedPodResources{
+			ContainerRecommendations: []v1.RecommendedContainerResources{
 				test.Recommendation().WithContainer(container2Name).WithTarget("300m", "10Gi").GetContainerResources(),
 			},
 		}
